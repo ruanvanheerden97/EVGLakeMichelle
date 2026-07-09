@@ -128,6 +128,25 @@ RETICULATION = [
     },
 ]
 
+# =====================================================================
+# SMART METERING STOCK ON HAND — edit here (or add a "Stock" sheet to the
+# spreadsheet with columns Item | Quantity, which overrides these values).
+# =====================================================================
+STOCK_ON_HAND = {
+    "breakout_board": 7,    # 8-probe LoRaWAN breakout boards
+    "antenna": 8,           # external antennas (1 per board / standalone)
+    "standalone": 1,        # single-meter standalone units (own antenna)
+    "optical_probe": 33,    # optical probes (1 per meter connection)
+}
+STOCK_LABELS = {
+    "breakout_board": "8-probe breakout board",
+    "antenna": "External antenna",
+    "standalone": "Standalone unit (1 meter)",
+    "optical_probe": "Optical probe",
+}
+BOARD_PORTS = 8
+
+
 # ---------- Helpers ----------
 def find_sheet(xls, candidates):
     for name in xls.sheet_names:
@@ -210,6 +229,16 @@ def load_data(file_path, _mtime):
         lambda v: "" if pd.isna(v) else fmt_serial(v)
     )
 
+    # Stand relabelling tracker: TRUE once the technician has confirmed the
+    # correct stand number. Defaults to True if the column isn't present.
+    if "Stand Updated" in raw.columns:
+        su = raw["Stand Updated"]
+        df["stand_updated"] = su.map(
+            lambda v: v if isinstance(v, bool) else str(v).strip().upper() == "TRUE"
+        ).fillna(False)
+    else:
+        df["stand_updated"] = True
+
     # Classify rows: MUNIC bulk is its own parent; minisubs are parented to it.
     munic_mask = df["serial"] == df["parent"]
     munic_serials = set(df.loc[munic_mask, "serial"])
@@ -237,6 +266,7 @@ def meter_dict(r):
         "date": r["commissioned"].strftime("%Y-%m-%d") if pd.notna(r["commissioned"]) else "",
         "reading": float(r["reading"]) if pd.notna(r["reading"]) else 0.0,
         "latest": float(r["latest_reading"]) if pd.notna(r["latest_reading"]) else None,
+        "stand_ok": bool(r["stand_updated"]),
     }
 
 
@@ -327,6 +357,87 @@ def build_hierarchy(df):
     return munic, tree, unassigned, mismatches
 
 
+def load_stock(file_path):
+    """On-hand stock: defaults from STOCK_ON_HAND, overridden by an optional
+    'Stock' sheet in the workbook (columns: Item | Quantity)."""
+    stock = dict(STOCK_ON_HAND)
+    try:
+        xls = pd.ExcelFile(file_path)
+        if "Stock" in xls.sheet_names:
+            s = xls.parse("Stock")
+            s.columns = [str(c).strip().lower() for c in s.columns]
+            for _, r in s.iterrows():
+                item = str(r.get("item", "")).lower()
+                qty = pd.to_numeric(r.get("quantity"), errors="coerce")
+                if pd.isna(qty):
+                    continue
+                if "board" in item or "breakout" in item:
+                    stock["breakout_board"] = int(qty)
+                elif "antenna" in item:
+                    stock["antenna"] = int(qty)
+                elif "standalone" in item:
+                    stock["standalone"] = int(qty)
+                elif "probe" in item:
+                    stock["optical_probe"] = int(qty)
+    except Exception:
+        pass
+    return stock
+
+
+def compute_stock_requirements(full_df):
+    """What hardware is still needed to finish smart metering, per location.
+
+    Rules (per kiosk / minisub / MUNIC):
+    - A location with a board already in service (any commissioned meter with an
+      AMR port) has 8 ports; remaining meters use free ports first.
+    - A location with no AMR yet and only 1 meter total → standalone unit.
+    - Otherwise → 8-probe breakout board(s) (1 per 8 meters).
+    - Every new board and every standalone needs 1 external antenna.
+    - Every outstanding meter connection needs 1 optical probe.
+    """
+    import math
+    rows = []
+    for kiosk, g in full_df.groupby("kiosk"):
+        outstanding = g[~g["amr"]]
+        if outstanding.empty:
+            continue
+        done = g[g["amr"]]
+        ports_used = int(len(done[done["amr_port"] != ""]))
+        has_board = ports_used > 0
+        n_out = len(outstanding)
+
+        boards = standalones = 0
+        if has_board:
+            overflow = max(0, n_out - (BOARD_PORTS - int(ports_used)))
+            boards = math.ceil(overflow / BOARD_PORTS)
+            fit = "existing board" + (f" + {boards} new" if boards else "")
+        elif len(g) == 1:
+            standalones = 1
+            fit = "standalone unit"
+        else:
+            boards = math.ceil(n_out / BOARD_PORTS)
+            fit = f"{boards} × 8-probe board"
+
+        rows.append({
+            "Location": kiosk,
+            "Outstanding Meters": n_out,
+            "Hardware": fit,
+            "Boards": boards,
+            "Standalones": standalones,
+            "Antennas": boards + standalones,
+            "Optical Probes": n_out,
+        })
+
+    req_df = pd.DataFrame(rows)
+    totals = {
+        "breakout_board": int(req_df["Boards"].sum()) if len(req_df) else 0,
+        "standalone": int(req_df["Standalones"].sum()) if len(req_df) else 0,
+        "antenna": int(req_df["Antennas"].sum()) if len(req_df) else 0,
+        "optical_probe": int(req_df["Optical Probes"].sum()) if len(req_df) else 0,
+    }
+    return req_df, totals
+
+
 def kiosk_to_ms_feeder():
     """Lookup: kiosk name → (ms_name, ms_serial, feeder name, position label)."""
     lookup = {}
@@ -360,10 +471,13 @@ if df is None:
 
 munic, tree, unassigned_kiosks, parent_mismatches = build_hierarchy(df)
 KIOSK_LOOKUP = kiosk_to_ms_feeder()
+stock_on_hand = load_stock(data_path)
+stock_req_df, stock_req_totals = compute_stock_requirements(df)
 
 meters_df = df[df["level"] == "meter"]
 bulk_df = df[df["level"] != "meter"]
 has_readings = meters_df["latest_reading"].notna().any()
+relabel_df = df[~df["stand_updated"]]
 
 st.title(f"⚡ {SITE_NAME} — Site Hierarchy & Smart Metering")
 st.caption(
@@ -378,18 +492,20 @@ amr_outstanding = total_meters - amr_done
 amr_pct = round(amr_done / total_meters * 100) if total_meters else 0
 total_feeders = sum(len(ms["feeders"]) for ms in tree)
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Unit / common meters", total_meters)
 c2.metric("Feeders", total_feeders, f"{meters_df['kiosk'].nunique()} kiosks")
 c3.metric("Smart metering done", amr_done, f"{amr_pct}%")
 c4.metric("Smart metering outstanding", amr_outstanding)
-c5.metric("Bulk & check meters", len(bulk_df))
+c5.metric("Stands to confirm", len(relabel_df))
+c6.metric("Bulk & check meters", len(bulk_df))
 
 st.divider()
 
 # ---------- Tabs ----------
-tab_hierarchy, tab_amr, tab_all, tab_kiosks, tab_map = st.tabs(
-    ["🗼 Site Hierarchy", "📡 Smart Metering (AMR)", "📋 All Meters", "🧰 Kiosk & Feeder Summary", "🗺️ Estate Map"]
+tab_hierarchy, tab_amr, tab_stock, tab_all, tab_kiosks, tab_map = st.tabs(
+    ["🗼 Site Hierarchy", "📡 Smart Metering (AMR)", "📦 Stock & Relabelling",
+     "📋 All Meters", "🧰 Kiosk & Feeder Summary", "🗺️ Estate Map"]
 )
 
 # =====================================================================
@@ -589,6 +705,7 @@ with tab_hierarchy:
   <div class="legend-item"><span class="legend-swatch" style="background:#3F7D5C33;border:1px solid #3F7D5C66"></span><span style="color:#6eb88a">Installed · Smart metering ✓</span></div>
   <div class="legend-item"><span class="legend-swatch" style="background:#E6913833;border:1px solid #E6913866"></span><span style="color:#d4902a">Installed · Smart metering outstanding</span></div>
   <div class="legend-item"><span class="legend-swatch" style="background:#2a2f3a55;border:1px dashed #4a5567"></span><span style="color:#8a93a3">Switchgear / no meter</span></div>
+  <div class="legend-item"><span style="color:#c9a86a">✎ = stand number still to be confirmed</span></div>
   <div class="legend-item"><span style="color:#7A96B2">— Cable specs shown on each feeder leg</span></div>
 </div>
 
@@ -625,6 +742,9 @@ function showPopup(e, m) {{
   const readingHtml = m.latest !== null && m.latest !== undefined
     ? `<div class="sp-row"><span class="sp-label">Latest reading</span><span class="sp-val">${{fmtKwh(m.latest)}}</span></div>`
     : `<div class="sp-row"><span class="sp-label">Opening reading</span><span class="sp-val">${{fmtKwh(m.reading)}}</span></div>`;
+  const standHtml = m.stand_ok
+    ? `<span class="sp-amr-ok">✓ Confirmed</span>`
+    : `<span class="sp-amr-miss">✎ To be confirmed</span>`;
   popup.innerHTML = `
     <div class="sp-stand">Stand ${{m.stand}}</div>
     <div class="sp-row"><span class="sp-label">Meter serial</span><span class="sp-val">${{m.serial}}</span></div>
@@ -633,6 +753,7 @@ function showPopup(e, m) {{
     <div class="sp-row"><span class="sp-label">Commissioned</span><span class="sp-val">${{m.date || '—'}}</span></div>
     ${{readingHtml}}
     <div class="sp-row"><span class="sp-label">Smart metering</span>${{amrHtml}}</div>
+    <div class="sp-row"><span class="sp-label">Stand number</span>${{standHtml}}</div>
   `;
   popup.classList.add('visible');
   popup.style.left = Math.min(e.clientX + 12, window.innerWidth - 260) + 'px';
@@ -754,8 +875,9 @@ function buildDiagram() {{
           let cls = m.amr ? 'stand-chip' : 'stand-chip no-amr';
           if (highlightSerials.has(m.serial)) cls += ' highlight';
           const dot = `<span class="amr-dot ${{m.amr ? 'ok' : 'missing'}}"></span>`;
-          const title = `Stand ${{m.stand}} · Serial: ${{m.serial}} · AMR: ${{m.amr ? '✓' + (m.port ? ' port ' + m.port : '') : 'outstanding'}}`;
-          return `<span class="${{cls}}" data-m='${{JSON.stringify(m).replace(/'/g, "&#39;")}}' title="${{title}}">${{dot}}${{m.stand}}</span>`;
+          const pen = m.stand_ok ? '' : ' <span style="color:#c9a86a">✎</span>';
+          const title = `Stand ${{m.stand}}${{m.stand_ok ? '' : ' (to be confirmed)'}} · Serial: ${{m.serial}} · AMR: ${{m.amr ? '✓' + (m.port ? ' port ' + m.port : '') : 'outstanding'}}`;
+          return `<span class="${{cls}}" data-m='${{JSON.stringify(m).replace(/'/g, "&#39;")}}' title="${{title}}">${{dot}}${{m.stand}}${{pen}}</span>`;
         }}).join('');
 
         const extrasHtml = (k.extras || []).map(x =>
@@ -913,6 +1035,105 @@ with tab_amr:
         )
 
 # =====================================================================
+# STOCK & RELABELLING TAB
+# =====================================================================
+with tab_stock:
+    st.subheader("📦 Smart Metering Stock")
+    st.caption(
+        "Kiosks with 2+ meters get an **8-probe LoRaWAN breakout board + external antenna**; "
+        "single-meter locations get a **standalone unit** (with its own external antenna). "
+        "Every meter connects to its board with an **optical probe**."
+    )
+
+    st.markdown("##### On hand")
+    st.caption(
+        "Counts below start from the stock register (edit `STOCK_ON_HAND` in app.py, or add a "
+        "`Stock` sheet — columns *Item | Quantity* — to the spreadsheet to make them persistent). "
+        "Adjust here as you install during the day; the balance updates live."
+    )
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    have = {
+        "breakout_board": sc1.number_input(STOCK_LABELS["breakout_board"], min_value=0,
+                                           value=stock_on_hand["breakout_board"], step=1, key="stk_board"),
+        "antenna": sc2.number_input(STOCK_LABELS["antenna"], min_value=0,
+                                    value=stock_on_hand["antenna"], step=1, key="stk_ant"),
+        "standalone": sc3.number_input(STOCK_LABELS["standalone"], min_value=0,
+                                       value=stock_on_hand["standalone"], step=1, key="stk_sa"),
+        "optical_probe": sc4.number_input(STOCK_LABELS["optical_probe"], min_value=0,
+                                          value=stock_on_hand["optical_probe"], step=1, key="stk_probe"),
+    }
+
+    st.markdown("##### Stock vs remaining installations")
+    bal_rows = []
+    for key in ["breakout_board", "standalone", "antenna", "optical_probe"]:
+        req = stock_req_totals[key]
+        bal = have[key] - req
+        bal_rows.append({
+            "Item": STOCK_LABELS[key],
+            "On Hand": have[key],
+            "Required": req,
+            "Balance": bal,
+            "Status": "✅ Enough" + (f" ({bal} spare)" if bal > 0 else "") if bal >= 0 else f"🔴 Short {-bal}",
+        })
+    bal_df = pd.DataFrame(bal_rows)
+    st.dataframe(bal_df, use_container_width=True, hide_index=True)
+
+    shortfalls = {r["Item"]: -r["Balance"] for r in bal_rows if r["Balance"] < 0}
+    spare_boards = next(r["Balance"] for r in bal_rows if r["Item"] == STOCK_LABELS["breakout_board"])
+    if not shortfalls:
+        st.success("✅ Current stock covers all remaining installations.")
+    else:
+        for item, n in shortfalls.items():
+            st.error(f"🔴 Short **{n} × {item}** for the remaining installations.")
+        if STOCK_LABELS["standalone"] in shortfalls and spare_boards >= shortfalls[STOCK_LABELS["standalone"]]:
+            st.info(
+                f"💡 You have {spare_boards} spare 8-probe board(s) — a spare board can stand in for a "
+                "standalone unit at a single-meter location (uses 1 of its 8 ports and still needs "
+                "1 antenna + 1 probe), if you'd rather not purchase a standalone."
+            )
+
+    with st.expander("🔧 What's needed where (per outstanding location)"):
+        st.dataframe(stock_req_df, use_container_width=True, hide_index=True)
+        st.caption(
+            "Locations that already have a live board reuse its free ports (8 per board). "
+            "MUNIC and other single-meter locations are sized for a standalone unit."
+        )
+
+    st.divider()
+
+    # ---- Stand relabelling tracker ----
+    st.subheader("✎ Stand Number Relabelling")
+    n_todo = len(relabel_df)
+    if n_todo == 0:
+        st.success("All stand numbers confirmed. ✅")
+    else:
+        r1, r2 = st.columns(2)
+        r1.metric("Stands to confirm", n_todo)
+        r2.metric("Confirmed", len(df) - n_todo, f"{round((len(df) - n_todo) / len(df) * 100)}%")
+
+        rl = relabel_df.assign(
+            feeder=relabel_df["kiosk"].map(lambda k: KIOSK_LOOKUP.get(k, ("", "", "—"))[2]),
+            ms_name=relabel_df["kiosk"].map(lambda k: KIOSK_LOOKUP.get(k, ("—",))[0]),
+        )
+        st.markdown("Technician worklist — stands still to be confirmed on site:")
+        show_table(
+            rl,
+            ["stand", "serial", "kiosk", "feeder", "ms_name", "model"],
+            {"stand": "Stand (current)", "serial": "Meter Serial", "kiosk": "Kiosk",
+             "feeder": "Feeder", "ms_name": "Minisub", "model": "Model"},
+            sort_col="Kiosk",
+        )
+        st.download_button(
+            "⬇️ Download relabelling worklist (CSV)",
+            rl[["stand", "serial", "kiosk", "feeder", "ms_name", "model"]].to_csv(index=False),
+            file_name="lake_michelle_stand_relabelling.csv",
+            mime="text/csv",
+        )
+        st.markdown("**Per kiosk:**")
+        per_kiosk = rl.groupby("kiosk").size().reset_index(name="Stands to confirm").rename(columns={"kiosk": "Kiosk"})
+        st.dataframe(per_kiosk, use_container_width=True, hide_index=True)
+
+# =====================================================================
 # ALL METERS TAB
 # =====================================================================
 with tab_all:
@@ -932,15 +1153,16 @@ with tab_all:
     view = view.assign(
         level_label=view["level"].map(level_labels),
         amr_label=view["amr"].map({True: "✓ Done", False: "⚠ Outstanding"}),
+        stand_label=view["stand_updated"].map({True: "✓", False: "✎ To confirm"}),
         feeder=view["kiosk"].map(lambda k: KIOSK_LOOKUP.get(k, ("", "", "—"))[2]),
     )
 
     show_table(
         view,
-        ["stand", "serial", "kiosk", "feeder", "level_label", "manufacturer", "model", "connection",
+        ["stand", "stand_label", "serial", "kiosk", "feeder", "level_label", "manufacturer", "model", "connection",
          "phase", "commissioned", "amr_label", "amr_port"],
-        {"stand": "Stand", "serial": "Meter Serial", "kiosk": "Kiosk", "feeder": "Feeder",
-         "level_label": "Level", "manufacturer": "Manufacturer", "model": "Model",
+        {"stand": "Stand", "stand_label": "Stand Confirmed", "serial": "Meter Serial", "kiosk": "Kiosk",
+         "feeder": "Feeder", "level_label": "Level", "manufacturer": "Manufacturer", "model": "Model",
          "connection": "Connection", "phase": "Phase", "commissioned": "Commissioned",
          "amr_label": "Smart Metering", "amr_port": "AMR Port"},
         sort_col="Kiosk",
